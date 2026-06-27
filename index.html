@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>onRide — Convite de Grupo</title>
+  <style>
+    body { font-family: sans-serif; display: flex; align-items: center;
+           justify-content: center; min-height: 100vh; margin: 0;
+           background: #0F1A22; color: #fff; text-align: center; padding: 24px; }
+    .logo { font-size: 32px; font-weight: 700; margin-bottom: 8px; }
+    .logo span { color: #0EBFBA; }
+    p { color: #aaa; margin: 8px 0 24px; }
+    a { display: inline-block; background: #0EBFBA; color: #000;
+        padding: 14px 32px; border-radius: 12px; text-decoration: none;
+        font-weight: 600; font-size: 16px; }
+  </style>
+  <script>
+    window.addEventListener('DOMContentLoaded', function () {
+      const params = new URLSearchParams(window.location.search);
+      const codigo = params.get('codigo');
+      if (codigo) {
+        // Tenta abrir o app direto
+        window.location.href = 'onride://convite?codigo=' + codigo;
+        // Fallback: botão visível se o app não abrir
+        document.getElementById('btn').href = 'onride://convite?codigo=' + codigo;
+        document.getElementById('codigo').textContent = codigo;
+      } else {
+        document.getElementById('info').textContent = 'Link de convite inválido.';
+      }
+    });
+  </script>
+</head>
+<body>
+  <div>
+    <div class="logo">on<span>Ride</span></div>
+    <p id="info">Abrindo o app... Se não abrir automaticamente:</p>
+    <a id="btn" href="#">Abrir onRide</a>
+    <p style="margin-top:16px; font-size:12px; color:#666">
+      Código: <strong id="codigo"></strong>
+    </p>
+  </div>
+</body>
+</html>

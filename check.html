@@ -1,1 +1,1839 @@
-editor
+import socket
+import time
+import json
+import os
+import queue
+import re
+import tempfile
+import threading
+import concurrent.futures
+import http.client
+import urllib.request
+import urllib.parse
+import urllib.error
+from datetime import datetime, timezone, timedelta
+
+# Proxy HTTP(S) usado alternadamente (sim/não) nas buscas à tibia.com, no formato "host:porta".
+# Deixe "" para desativar e buscar sempre direto, sem proxy.
+PROXY_TIBIA = "159.195.69.220:8888"
+
+# UID (client unique identifier, fixo, não muda entre conexões) autorizado a usar !recoveredit
+# para se autopromover a Editor. É um mecanismo de recuperação de acesso ("break glass") caso o
+# dono do servidor fique sem nenhum Editor disponível para promovê-lo de volta.
+UID_RECUPERACAO_EDITOR = "/1rcz+LT+ZHzeLyphRKJsKor8TE="
+
+# O bot roda na mesma máquina do ts3server.exe, então conecta via localhost: é mais rápido,
+# não depende do Tailscale e é imune à proteção anti-flood da query (127.0.0.1 é sempre isento).
+TS_HOST = "100.85.164.106"
+TS_PORT = 10011
+# Autenticação sem usuário/senha fixos: o bot usa só esta API-KEY (interface WebQuery, HTTP na
+# porta 10080) para se autoprovisionar a cada conexão — recria o login de query QUERY_LOGIN_BOT
+# (a senha é gerada pelo servidor na hora e nunca fica salva em lugar nenhum) e coloca a si mesmo
+# no grupo nativo "Admin Server Query" (plenos poderes). O telnet (porta 10011) continua sendo
+# usado para o restante, pois é o único canal que recebe eventos (mensagens privadas, conexões);
+# a WebQuery é apenas requisição/resposta e o telnet puro não aceita API-KEY (limite do protocolo).
+TS_APIKEY = "BADwYSzk-UUHWA3kQ5-0JViKb5-PBtzM02mCXR1"
+WEBQUERY_PORT = 10080
+QUERY_LOGIN_BOT = "vbot"
+NOME_GRUPO_ADMIN_SERVER_QUERY = "Admin Server Query"
+VIRTUAL_SERVER_ID = 1
+TEXTO_BOAS_VINDAS = "Olá! Bem-vindo ao nosso servidor."
+NOME_GRUPO_TSBOT = "TSBot"
+NOME_GRUPO_TSBOT_ADMIN = "TSBot Admin"
+# Poder necessário para ALGUÉM conseguir atribuir cada grupo do bot a um cliente (i_group_needed_member_*).
+# TSBOT_ADMIN fica bem mais alto que o do Server Admin (veja PERMISSOES_HIERARQUIA) de propósito:
+# Server Admin pode dar TSBot a alguém, mas não pode dar TSBot Admin (só o Editor consegue).
+PODER_NECESSARIO_GRUPO_TSBOT = 75
+PODER_NECESSARIO_GRUPO_TSBOT_ADMIN = 95
+NOME_CANAL_HUNTED = "Hunted List"
+NOME_CANAL_FRIEND = "Friend List"
+DECORACAO_NOME_CANAL = "✖"
+ALINHAMENTO_NOME_CANAL = "[cspacer]"
+PERMISSOES_ESTRUTURA_CANAIS = {
+    "i_channel_needed_join_power": 75,
+    "i_channel_needed_subscribe_power": 75,
+    "i_channel_needed_description_view_power": 75,
+    "i_channel_needed_modify_power": 75,
+    "i_channel_needed_delete_power": 75,
+}
+
+# ---- Hierarquia de Server Groups (comando !creategroups) ----
+NOME_GRUPO_GUEST = "Guest"
+NOME_GRUPO_EDITOR = "Editor"
+NOME_GRUPO_SERVER_ADMIN = "Server Admin"
+NOME_GRUPO_ADMIN = "Admin"
+NOME_GRUPO_ADMIN_ALIADO = "Admin Aliado"
+NOME_GRUPO_MEMBER = "Member"
+NOME_GRUPO_ALIADO_HIERARQUIA = "Aliado"
+NOME_GRUPO_CONVIDADO = "Convidado"
+
+# Guest não pode ser apagado (o TS3 recusa) e Server Admin/Editor são preservados por pedido explícito;
+# tudo mais é apagado quando !creategroups roda.
+GRUPOS_PROTEGIDOS_CRIAR_GRUPOS = {NOME_GRUPO_GUEST, NOME_GRUPO_SERVER_ADMIN, NOME_GRUPO_EDITOR}
+
+# Ordem de criação/(re)configuração ao rodar !creategroups (Guest fica de fora: não é mexido).
+ORDEM_HIERARQUIA = [
+    NOME_GRUPO_EDITOR, NOME_GRUPO_SERVER_ADMIN, NOME_GRUPO_ADMIN, NOME_GRUPO_ADMIN_ALIADO,
+    NOME_GRUPO_MEMBER, NOME_GRUPO_ALIADO_HIERARQUIA, NOME_GRUPO_CONVIDADO,
+]
+
+# Permissões de cada grupo. Convenção: "i_client_X_power" é o poder que o PRÓPRIO cliente tem pra agir
+# (mover/kickar/etc); "i_client_needed_X_power" é a resistência dele a sofrer essa ação de outros;
+# "i_group_needed_member_add/remove_power" é o quanto alguém precisa ter de i_group_member_add/remove_power
+# pra conseguir atribuir/remover ESTE grupo de um cliente. Valores de resistência ficam sempre um degrau
+# acima do poder de ataque do mesmo nível, pra nunca empatar (não sabemos ao certo se o TS3 trata empate
+# como permitido ou bloqueado, então evitamos o empate de propósito).
+PERMISSOES_HIERARQUIA = {
+    NOME_GRUPO_EDITOR: {
+        "i_client_move_power": 100,
+        "i_client_kick_from_server_power": 100,
+        "i_client_kick_from_channel_power": 100,
+        "i_client_needed_move_power": 100,
+        "i_client_needed_kick_from_server_power": 100,
+        "i_client_needed_kick_from_channel_power": 100,
+        "b_client_ban_create": 1,
+        "i_group_member_add_power": 100,
+        "i_group_member_remove_power": 100,
+        "i_group_needed_member_add_power": 100,
+        "i_group_needed_member_remove_power": 100,
+        "i_client_permission_modify_power": 100,
+        "b_virtualserver_servergroup_create": 1,
+        "b_virtualserver_servergroup_delete": 1,
+        "i_channel_join_power": 100,
+        "i_channel_subscribe_power": 100,
+        "i_channel_description_view_power": 100,
+        "i_channel_modify_power": 100,
+        "i_channel_delete_power": 100,
+    },
+    NOME_GRUPO_SERVER_ADMIN: {
+        "i_client_move_power": 90,
+        "i_client_kick_from_server_power": 90,
+        "i_client_kick_from_channel_power": 90,
+        # Resistência 95 (> 90): um Server Admin não consegue mover/kickar/banir outro Server Admin.
+        "i_client_needed_move_power": 95,
+        "i_client_needed_kick_from_server_power": 95,
+        "i_client_needed_kick_from_channel_power": 95,
+        "b_client_ban_create": 1,
+        # 80 cobre o needed=75 do TSBot, mas fica abaixo do needed=95 do TSBot Admin.
+        "i_group_member_add_power": 80,
+        "i_group_member_remove_power": 80,
+        # Só quem tem group_member_add_power=100 (Editor) promove alguém a Server Admin.
+        "i_group_needed_member_add_power": 100,
+        "i_group_needed_member_remove_power": 100,
+        "i_channel_join_power": 90,
+        "i_channel_subscribe_power": 90,
+        "i_channel_description_view_power": 90,
+        "i_channel_modify_power": 90,
+        "i_channel_delete_power": 90,
+    },
+    NOME_GRUPO_ADMIN: {
+        "i_client_move_power": 50,
+        "i_client_needed_move_power": 30,
+        "i_channel_join_power": 50,
+        "i_channel_subscribe_power": 50,
+        "i_channel_description_view_power": 50,
+        # Server Admin (80) e Editor (100) podem atribuir este grupo; Admin não atribui nada a ninguém.
+        "i_group_needed_member_add_power": 50,
+        "i_group_needed_member_remove_power": 50,
+    },
+    NOME_GRUPO_MEMBER: {
+        "i_client_move_power": 0,
+        "i_client_needed_move_power": 10,
+        "i_channel_join_power": 10,
+        "i_channel_subscribe_power": 10,
+        "i_channel_description_view_power": 10,
+        "i_group_needed_member_add_power": 50,
+        "i_group_needed_member_remove_power": 50,
+    },
+    NOME_GRUPO_CONVIDADO: {
+        "i_client_move_power": 0,
+        "i_client_needed_move_power": 10,
+        "i_channel_join_power": 10,
+        "i_channel_subscribe_power": 10,
+        "i_channel_description_view_power": 10,
+        "i_group_needed_member_add_power": 50,
+        "i_group_needed_member_remove_power": 50,
+    },
+}
+# Admin Aliado tem exatamente as mesmas permissões do Admin (mesmo degrau da hierarquia).
+PERMISSOES_HIERARQUIA[NOME_GRUPO_ADMIN_ALIADO] = dict(PERMISSOES_HIERARQUIA[NOME_GRUPO_ADMIN])
+# Aliado tem exatamente as mesmas permissões do Member/Convidado (mesmo degrau da hierarquia).
+PERMISSOES_HIERARQUIA[NOME_GRUPO_ALIADO_HIERARQUIA] = dict(PERMISSOES_HIERARQUIA[NOME_GRUPO_MEMBER])
+
+MAX_DESC_BYTES = 7500
+# Tempo entre ciclos de busca de mortes no Tibia (segundos).
+# Reduzindo, o bot consulta mais rápido, mas tenha cuidado com bloqueios do site.
+PAUSA_ENTRE_CICLOS = 1
+JANELA_MORTE_RECENTE_SEGUNDOS = 300
+# Só personagens neste nível ou acima têm a morte verificada/anunciada.
+NIVEL_MINIMO_MONITORAR_MORTE = 200
+MAX_BUSCAS_PARALELAS = 16
+# Intervalo mínimo entre requisições ao Tibia para evitar comportamento de scraping agressivo.
+# Em 0.05 o Cloudflare tolera operação contínua (validado no vbot.log); abaixo disso ele
+# começa a devolver 403 e escala o bloqueio, forçando o fallback pelo proxy lento.
+INTERVALO_MIN_REQ = 0.06
+# Tempo máximo (segundos) esperando cada resposta da tibia.com; acima disso desiste e
+# tenta a rota reserva, para uma requisição travada não segurar o ciclo inteiro.
+TIMEOUT_REQUISICAO = 6
+ARQUIVO_DADOS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.json")
+ARQUIVO_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vbot.log")
+TSBOT_SGID = None
+TSBOT_ADMIN_SGID = None
+SERVER_ADMIN_SGID = None
+EDITOR_SGID = None
+DADOS = {"world": None, "guilds": {}, "channels": {}, "seen_deaths": {}}
+DADOS_LOCK = threading.Lock()
+LOG_LOCK = threading.Lock()
+REFRESH_EVENT = threading.Event()
+ONLINE_DESDE = {}
+ULTIMO_ESTADO_CANAL = {}
+
+def log(mensagem, so_console=False):
+    bruto = str(mensagem)
+    quebras_iniciais = len(bruto) - len(bruto.lstrip("\n"))
+    hora = datetime.now().strftime("%H:%M:%S")
+    print("\n" * quebras_iniciais + f"[{hora}] {bruto[quebras_iniciais:]}")
+    if so_console:
+        return
+    texto = bruto.strip("\n")
+    if not texto:
+        return
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    linha = f"[{timestamp}] {texto}"
+    try:
+        with LOG_LOCK:
+            with open(ARQUIVO_LOG, "a", encoding="utf-8") as f:
+                f.write(linha + "\n")
+    except OSError as e:
+        print(f"[AVISO] Falha ao escrever no log {ARQUIVO_LOG}: {e}")
+
+def carregar_dados():
+    global DADOS
+    try:
+        with open(ARQUIVO_DADOS, "r", encoding="utf-8") as f:
+            carregado = json.load(f)
+        with DADOS_LOCK:
+            DADOS = {
+                "world": carregado.get("world"),
+                "guilds": carregado.get("guilds", {}),
+                "channels": carregado.get("channels", {}),
+                "seen_deaths": carregado.get("seen_deaths", {}),
+            }
+        log(f"[OK] Dados carregados de {ARQUIVO_DADOS} ({len(DADOS['guilds'])} guild(s) cadastrada(s)).")
+    except FileNotFoundError:
+        log(f"[INFO] {ARQUIVO_DADOS} ainda não existe. Começando com dados vazios.")
+    except (json.JSONDecodeError, OSError) as e:
+        log(f"[AVISO] Não foi possível ler {ARQUIVO_DADOS} ({e}). Começando com dados vazios.")
+
+def salvar_dados():
+    diretorio = os.path.dirname(ARQUIVO_DADOS)
+    try:
+        fd, caminho_tmp = tempfile.mkstemp(dir=diretorio, suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(DADOS, f, ensure_ascii=False, indent=2)
+        os.replace(caminho_tmp, ARQUIVO_DADOS)
+    except OSError as e:
+        log(f"[ERRO] Falha ao salvar {ARQUIVO_DADOS}: {e}")
+
+def escapar_ts(texto):
+    return (str(texto)
+            .replace("\\", r"\\")
+            .replace("/", r"\/")
+            .replace(" ", r"\s")
+            .replace("|", r"\p")
+            .replace("\n", r"\n"))
+
+def desescapar_ts(texto):
+    return (str(texto)
+            .replace(r"\n", "\n")
+            .replace(r"\p", "|")
+            .replace(r"\s", " ")
+            .replace(r"\/", "/")
+            .replace(r"\\", "\\"))
+
+def ler_resposta_comando(sock):
+    resposta = ""
+    while "error id=" not in resposta:
+        chunk = sock.recv(1024).decode('utf-8', errors='ignore')
+        if not chunk:
+            break
+        resposta += chunk
+    return resposta
+
+# ---- WebQuery (HTTP + API-KEY): usada só para o bootstrap de credenciais/permissões ----
+
+# Opener sem proxy: a WebQuery fala direto com o servidor TS3, nunca pelo proxy da tibia.com.
+_OPENER_WEBQUERY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+# Credenciais (login, senha) provisionadas nesta execução; a senha é gerada pelo servidor
+# e vive só na memória do processo.
+_CRED_QUERY = [None]
+_CRED_QUERY_LOCK = threading.Lock()
+
+def _webquery(caminho, params=None):
+    url = f"http://{TS_HOST}:{WEBQUERY_PORT}/{caminho}"
+    corpo = json.dumps(params or {}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=corpo,
+        headers={"x-api-key": TS_APIKEY, "Content-Type": "application/json"},
+    )
+    try:
+        with _OPENER_WEBQUERY.open(req, timeout=10) as r:
+            return json.loads(r.read().decode("utf-8", "ignore"))
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode("utf-8", "ignore"))
+        except (ValueError, OSError):
+            return {"status": {"code": -1, "message": f"HTTP {e.code} ({e.reason})"}}
+    except (OSError, ValueError) as e:
+        return {"status": {"code": -2, "message": str(e)}}
+
+def _provisionar_login_query():
+    # Recria o login de query do bot via API-KEY. O del+add força o servidor a gerar uma senha
+    # nova, então nenhuma senha precisa existir no código ou em arquivo.
+    lista = _webquery("0/queryloginlist", {"pattern": QUERY_LOGIN_BOT})
+    for item in lista.get("body") or []:
+        if item.get("cldbid"):
+            _webquery("0/querylogindel", {"cldbid": item["cldbid"]})
+
+    novo = _webquery("0/queryloginadd", {"client_login_name": QUERY_LOGIN_BOT})
+    corpo = (novo.get("body") or [{}])[0]
+    senha = corpo.get("client_login_password")
+    if novo.get("status", {}).get("code") != 0 or not senha:
+        raise ErroConfiguracao(
+            f"Falha ao provisionar o login de query via WebQuery: {novo.get('status')}. "
+            f"Verifique se a API-KEY é válida e se a WebQuery (porta {WEBQUERY_PORT}) está ativa."
+        )
+    log(f"[OK] Login de query '{QUERY_LOGIN_BOT}' provisionado via API-KEY (senha gerada pelo servidor).")
+    return QUERY_LOGIN_BOT, senha
+
+def _garantir_admin_server_query(cldbid):
+    # Coloca o cldbid do bot no grupo nativo Admin Server Query (todas as permissões no máximo).
+    # É o equivalente moderno de logar como serveradmin, mas concedido via API-KEY.
+    grupos = _webquery(f"{VIRTUAL_SERVER_ID}/servergrouplist")
+    sgid = None
+    for g in grupos.get("body") or []:
+        if g.get("type") == "2" and g.get("name") == NOME_GRUPO_ADMIN_SERVER_QUERY:
+            sgid = g.get("sgid")
+            break
+    if not sgid:
+        sgid = "2"  # sgid padrão do Admin Server Query em instalações TS3 de fábrica
+
+    r = _webquery(f"{VIRTUAL_SERVER_ID}/servergroupaddclient", {"sgid": sgid, "cldbid": cldbid})
+    codigo = r.get("status", {}).get("code")
+    mensagem = r.get("status", {}).get("message", "")
+    # "duplicate entry" = já é membro do grupo, que é exatamente o estado desejado.
+    return codigo == 0 or "duplicate" in mensagem
+
+def _decompor_comando(linha):
+    # Converte uma linha no formato de fio do ServerQuery ("clientpoke clid=5 msg=Ol\sá")
+    # em (nome, params desescapados, opções tipo "-flags") para envio via WebQuery.
+    partes = linha.strip().split(" ")
+    nome, params = partes[0], {}
+    for p in partes[1:]:
+        if not p:
+            continue
+        if p.startswith("-") and "=" not in p:
+            params[p] = ""
+        elif "=" in p:
+            chave, valor = p.split("=", 1)
+            params[chave] = desescapar_ts(valor)
+    return nome, params
+
+def _wire_de_json(resposta):
+    # Reconstrói o formato de fio do ServerQuery a partir do JSON da WebQuery, para que
+    # todos os parsers existentes do bot funcionem idênticos nas duas rotas.
+    itens = []
+    for item in resposta.get("body") or []:
+        pares = []
+        for chave, valor in item.items():
+            pares.append(f"{chave}={escapar_ts(valor)}" if valor not in (None, "") else chave)
+        itens.append(" ".join(pares))
+    dados = "|".join(itens)
+    status = resposta.get("status") or {}
+    fim = f"error id={status.get('code', -2)} msg={escapar_ts(status.get('message', ''))}"
+    return (dados + "\n" if dados else "") + fim + "\n"
+
+class Conexao:
+    """Transporte híbrido do bot: toda execução sai pela WebQuery (HTTP + API-KEY); o telnet
+    fica reservado ao que o HTTP não faz — receber eventos (mensagens privadas, entradas de
+    clientes) e ser o REMETENTE das mensagens/pokes, para que as respostas dos usuários
+    (comandos !) cheguem ao próprio bot em vez de se perderem no cliente interno da WebQuery."""
+
+    COMANDOS_TELNET = {"sendtextmessage", "clientpoke", "clientupdate",
+                       "servernotifyregister", "whoami"}
+
+    def __init__(self, sock):
+        self._sock = sock
+        self._sock.settimeout(None)
+        self.eventos = queue.Queue()
+        self._respostas = queue.Queue()
+        self._lock_telnet = threading.Lock()
+        self.morta = threading.Event()
+        threading.Thread(target=self._ler_para_sempre, daemon=True).start()
+
+    def _ler_para_sempre(self):
+        # Única leitora do socket: separa eventos (notify*) das respostas de comandos, para
+        # que o loop principal e o worker possam usar o mesmo telnet sem corromper o fluxo.
+        buffer = ""
+        resposta = []
+        try:
+            while True:
+                dados = self._sock.recv(4096).decode("utf-8", errors="ignore")
+                if not dados:
+                    break
+                buffer += dados
+                while "\n" in buffer:
+                    linha, buffer = buffer.split("\n", 1)
+                    linha = linha.strip()
+                    if not linha:
+                        continue
+                    if linha.startswith("notify"):
+                        self.eventos.put(linha)
+                    else:
+                        resposta.append(linha)
+                        if linha.startswith("error id="):
+                            self._respostas.put("\n".join(resposta) + "\n")
+                            resposta = []
+        except OSError:
+            pass
+        finally:
+            self.morta.set()
+            self.eventos.put(None)  # acorda o loop principal para reconectar
+
+    def telnet(self, comando):
+        with self._lock_telnet:
+            while not self._respostas.empty():  # descarta resposta órfã de um timeout anterior
+                try:
+                    self._respostas.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                self._sock.sendall((comando + "\n").encode("utf-8"))
+                return self._respostas.get(timeout=15.0)
+            except (OSError, queue.Empty):
+                self.morta.set()
+                return "error id=-3 msg=conexao\\sperdida\n"
+
+    def web(self, comando):
+        nome, params = _decompor_comando(comando)
+        return _wire_de_json(_webquery(f"{VIRTUAL_SERVER_ID}/{nome}", params))
+
+    def cmd(self, comando):
+        if comando.split(" ", 1)[0] in self.COMANDOS_TELNET:
+            return self.telnet(comando)
+        return self.web(comando)
+
+    def fechar(self):
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+def enviar_mensagem_privada(conn, clid, texto):
+    resposta = conn.cmd(f"sendtextmessage targetmode=1 target={clid} msg={escapar_ts(texto)}")
+    if "error id=0" not in resposta:
+        log(f"[AVISO] Falha ao enviar mensagem privada para clid={clid}: {resposta.strip()}")
+        return False
+    return True
+
+def _buscar_ou_criar_grupo(conn, nome_grupo):
+    res = conn.cmd("servergrouplist")
+    dados = res.split("error id=")[0].strip()
+
+    if dados:
+        for grupo in dados.split("|"):
+            atributos = {}
+            for item in grupo.split(" "):
+                if "=" in item:
+                    chave, valor = item.split("=", 1)
+                    atributos[chave] = valor
+
+            if atributos.get("name", "").replace(r"\s", " ") == nome_grupo:
+                sgid = atributos.get("sgid")
+                log(f"[OK] Server group '{nome_grupo}' já existe (sgid={sgid}).")
+                return sgid
+
+    log(f"[INFO] Server group '{nome_grupo}' não encontrado. Criando...")
+    res = conn.cmd(f"servergroupadd name={escapar_ts(nome_grupo)} type=1")
+    dados = res.split("error id=")[0].strip()
+
+    sgid = None
+    for token in dados.replace("\r", " ").replace("\n", " ").split(" "):
+        if token.startswith("sgid="):
+            sgid = token.split("=", 1)[1]
+            break
+
+    if not sgid:
+        log(f"[ERRO] Falha ao criar o server group '{nome_grupo}'.")
+        return None
+
+    log(f"[OK] Server group '{nome_grupo}' criado com sucesso (sgid={sgid}).")
+    return sgid
+
+def _definir_permissao_grupo(conn, sgid, permsid, valor):
+    resposta = conn.cmd(
+        f"servergroupaddperm sgid={sgid} permsid={permsid} "
+        f"permvalue={valor} permnegated=0 permskip=0"
+    )
+    if "error id=0" not in resposta:
+        log(f"[AVISO] Falha ao definir '{permsid}={valor}' no sgid={sgid}: {resposta.strip()}")
+        return False
+    return True
+
+def garantir_grupo(conn, nome_grupo, poder_necessario):
+    sgid = _buscar_ou_criar_grupo(conn, nome_grupo)
+    if not sgid:
+        return None
+
+    _definir_permissao_grupo(conn, sgid, "i_group_needed_member_add_power", poder_necessario)
+    _definir_permissao_grupo(conn, sgid, "i_group_needed_member_remove_power", poder_necessario)
+    return sgid
+
+def aplicar_permissoes_grupo(conn, sgid, permissoes):
+    aplicadas = 0
+    for permsid, valor in permissoes.items():
+        if _definir_permissao_grupo(conn, sgid, permsid, valor):
+            aplicadas += 1
+    return aplicadas
+
+def _buscar_proprio_cldbid(conn):
+    res = conn.cmd("whoami")
+    dados = res.split("error id=")[0].strip()
+    for item in dados.split(" "):
+        if item.startswith("client_database_id="):
+            return item.split("=", 1)[1]
+    return None
+
+def garantir_permissoes_proprias(conn):
+    # Plenos poderes do bot: em vez de se autoconceder permissões uma a uma (impossível quando o
+    # teto do próprio bot está baixo — trava de segurança do TS3), o bot é colocado no grupo nativo
+    # Admin Server Query via WebQuery (API-KEY), que tem todas as permissões no máximo. Cobre
+    # !creategroups e !recoveredit inteiros, sem depender de nenhum grupo da hierarquia.
+    cldbid = _buscar_proprio_cldbid(conn)
+    if not cldbid:
+        log("[AVISO] Não foi possível identificar o client_database_id do próprio bot; "
+            "atribuições de server group (!creategroups, !recoveredit) podem falhar por falta de permissão.")
+        return
+
+    if _garantir_admin_server_query(cldbid):
+        log(f"[OK] Permissões próprias do bot garantidas (cldbid={cldbid}, grupo {NOME_GRUPO_ADMIN_SERVER_QUERY}).")
+    else:
+        log(f"[AVISO] Falha ao garantir o grupo {NOME_GRUPO_ADMIN_SERVER_QUERY} ao bot (cldbid={cldbid}) "
+            "via WebQuery. Verifique a API-KEY e a porta da WebQuery; sem isso, comandos do bot podem "
+            "falhar por falta de permissão.")
+
+def remetente_autorizado(conn, clid_remetente, sgid_exigido):
+    if not sgid_exigido or not clid_remetente:
+        return False
+
+    res = conn.cmd(f"clientinfo clid={clid_remetente}")
+    dados = res.split("error id=")[0].strip()
+
+    for item in dados.split(" "):
+        if item.startswith("client_servergroups="):
+            grupos = item.split("=", 1)[1].split(",")
+            return sgid_exigido in grupos
+
+    return False
+
+def processar_mass_poke(conn, texto_poke, clid_remetente, uid_remetente, nick_remetente):
+    log(f"\n[COMANDO PRIVADO] {nick_remetente} solicitou Mass Poke: '{texto_poke}'")
+
+    res = conn.cmd("clientlist")
+
+    partes = res.split("error id=")
+    dados_clientes = partes[0].strip()
+
+    if not dados_clientes:
+        log("[AVISO] Nenhum utilizador encontrado para receber o poke.")
+        return
+
+    usuarios = dados_clientes.split("|")
+    contador = 0
+
+    if clid_remetente and uid_remetente:
+        remetente_exibido = f"[URL=client://{clid_remetente}/{uid_remetente}~{nick_remetente}]{nick_remetente}[/URL]"
+    else:
+        remetente_exibido = nick_remetente
+
+    mensagem_final = f"{remetente_exibido}: {texto_poke}"
+    mensagem_escapada = escapar_ts(mensagem_final)
+
+    for usuario in usuarios:
+        atributos = {}
+        for item in usuario.split(" "):
+            if "=" in item:
+                chave, valor = item.split("=", 1)
+                atributos[chave] = valor
+
+        if atributos.get("client_type") == "0":
+            clid = atributos.get("clid")
+            nome_alvo = atributos.get("client_nickname", "").replace(r"\s", " ")
+
+            conn.cmd(f"clientpoke clid={clid} msg={mensagem_escapada}")
+
+            log(f"   -> Poke enviado para: {nome_alvo}")
+            contador += 1
+            time.sleep(0.1)
+
+    log(f"[SUCESSO] Mass Poke concluído! Total de {contador} jogadores notificados.")
+
+def processar_mass_move(conn, clid_remetente, nick_remetente):
+    log(f"\n[COMANDO PRIVADO] {nick_remetente} solicitou Mass Move.")
+
+    res = conn.cmd("clientlist")
+
+    partes = res.split("error id=")
+    dados_clientes = partes[0].strip()
+
+    if not dados_clientes:
+        log("[AVISO] Nenhum utilizador encontrado para mover.")
+        return
+
+    usuarios = dados_clientes.split("|")
+
+    canal_destino = None
+    for usuario in usuarios:
+        atributos = {}
+        for item in usuario.split(" "):
+            if "=" in item:
+                chave, valor = item.split("=", 1)
+                atributos[chave] = valor
+        if atributos.get("clid") == clid_remetente:
+            canal_destino = atributos.get("cid")
+            break
+
+    if not canal_destino:
+        log("[ERRO] Não foi possível identificar o canal atual do remetente.")
+        return
+
+    contador = 0
+    for usuario in usuarios:
+        atributos = {}
+        for item in usuario.split(" "):
+            if "=" in item:
+                chave, valor = item.split("=", 1)
+                atributos[chave] = valor
+
+        if atributos.get("client_type") == "0" and atributos.get("clid") != clid_remetente:
+            clid = atributos.get("clid")
+            nome_alvo = atributos.get("client_nickname", "").replace(r"\s", " ")
+
+            conn.cmd(f"clientmove clid={clid} cid={canal_destino}")
+
+            log(f"   -> Movido para o canal: {nome_alvo}")
+            contador += 1
+            time.sleep(0.1)
+
+    log(f"[SUCESSO] Mass Move concluído! Total de {contador} jogadores movidos.")
+
+def processar_mass_kick(conn, clid_remetente, nick_remetente):
+    log(f"\n[COMANDO PRIVADO] {nick_remetente} solicitou Mass Kick.")
+
+    res = conn.cmd("clientlist")
+
+    partes = res.split("error id=")
+    dados_clientes = partes[0].strip()
+
+    if not dados_clientes:
+        log("[AVISO] Nenhum utilizador encontrado para kickar.")
+        return
+
+    usuarios = dados_clientes.split("|")
+    contador = 0
+
+    for usuario in usuarios:
+        atributos = {}
+        for item in usuario.split(" "):
+            if "=" in item:
+                chave, valor = item.split("=", 1)
+                atributos[chave] = valor
+
+        if atributos.get("client_type") == "0" and atributos.get("clid") != clid_remetente:
+            clid = atributos.get("clid")
+            nome_alvo = atributos.get("client_nickname", "").replace(r"\s", " ")
+
+            conn.cmd(f"clientkick clid={clid} reasonid=5 reasonmsg=Mass\\sKick")
+
+            log(f"   -> Kickado do servidor: {nome_alvo}")
+            contador += 1
+            time.sleep(0.1)
+
+    log(f"[SUCESSO] Mass Kick concluído! Total de {contador} jogadores kickados.")
+
+def enviar_mensagem_para_todos(conn, texto):
+    res = conn.cmd("clientlist")
+    dados_clientes = res.split("error id=")[0].strip()
+
+    if not dados_clientes:
+        return
+
+    contador = 0
+    falhas = 0
+    for usuario in dados_clientes.split("|"):
+        atributos = {}
+        for item in usuario.split(" "):
+            if "=" in item:
+                chave, valor = item.split("=", 1)
+                atributos[chave] = valor
+
+        if atributos.get("client_type") == "0":
+            clid = atributos.get("clid")
+            nome_alvo = atributos.get("client_nickname", "").replace(r"\s", " ")
+
+            if enviar_mensagem_privada(conn, clid, texto):
+                log(f"   -> Mensagem enviada para: {nome_alvo}")
+                contador += 1
+            else:
+                log(f"   -> FALHA ao enviar para: {nome_alvo}")
+                falhas += 1
+            time.sleep(0.1)
+
+    log(f"[OK] Mensagem enviada para {contador} utilizador(es) já conectado(s)."
+          + (f" ({falhas} falha(s), veja os avisos acima)" if falhas else ""))
+
+def mass_poke_sistema(conn, mensagem):
+    res = conn.cmd("clientlist")
+    dados_clientes = res.split("error id=")[0].strip()
+
+    if not dados_clientes:
+        return
+
+    mensagem_escapada = escapar_ts(mensagem)
+    contador = 0
+    for usuario in dados_clientes.split("|"):
+        atributos = {}
+        for item in usuario.split(" "):
+            if "=" in item:
+                chave, valor = item.split("=", 1)
+                atributos[chave] = valor
+
+        if atributos.get("client_type") == "0":
+            clid = atributos.get("clid")
+            conn.cmd(f"clientpoke clid={clid} msg={mensagem_escapada}")
+            contador += 1
+            time.sleep(0.1)
+
+    log(f"[MORTE] Aviso enviado para {contador} utilizador(es) online.")
+
+TIBIA_COM_BASE = "https://www.tibia.com/community/?"
+TIBIA_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+_MESES_TIBIA = {m: i for i, m in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
+_REQ_LOCK = threading.Lock()
+_PROX_SLOT = [0.0]
+_CB_CONTADOR = [0]
+_ERROS_TIBIA_CICLO = [0]
+_OPENER_PROXY = (
+    urllib.request.build_opener(urllib.request.ProxyHandler({"http": PROXY_TIBIA, "https": PROXY_TIBIA}))
+    if PROXY_TIBIA else None
+)
+_HTTP_LOCAL = threading.local()
+
+def _buscar_direto(url):
+    # Conexão persistente (keep-alive) por thread: sem um handshake TLS novo a cada
+    # requisição, o Cloudflare para de ver rajadas de conexões novas (menos 403).
+    caminho = url[len("https://www.tibia.com"):]
+    headers = {"User-Agent": TIBIA_UA, "Accept": "text/html", "Connection": "keep-alive"}
+    for forcar_nova in (False, True):
+        conn = getattr(_HTTP_LOCAL, "conn", None)
+        if conn is None or forcar_nova:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            conn = http.client.HTTPSConnection("www.tibia.com", timeout=TIMEOUT_REQUISICAO)
+            _HTTP_LOCAL.conn = conn
+        try:
+            conn.request("GET", caminho, headers=headers)
+            resp = conn.getresponse()
+            corpo = resp.read()
+        except (http.client.HTTPException, OSError):
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _HTTP_LOCAL.conn = None
+            if forcar_nova:
+                raise
+            continue  # a conexão keep-alive envelheceu; repete uma vez com conexão nova
+        if resp.status != 200:
+            raise urllib.error.HTTPError(url, resp.status, resp.reason, resp.headers, None)
+        return corpo
+    return None
+
+def _abrir_requisicao(req, usar_proxy):
+    if usar_proxy:
+        with _OPENER_PROXY.open(req, timeout=TIMEOUT_REQUISICAO) as r:
+            return r.read()
+    return _buscar_direto(req.full_url)
+
+def _registrar_erro_tibia():
+    with _REQ_LOCK:
+        _ERROS_TIBIA_CICLO[0] += 1
+
+def _aguardar_vez():
+    with _REQ_LOCK:
+        inicio = max(time.time(), _PROX_SLOT[0])
+        _PROX_SLOT[0] = inicio + INTERVALO_MIN_REQ
+    atraso = inicio - time.time()
+    if atraso > 0:
+        time.sleep(atraso)
+
+def _variar_caixa(valor):
+    with _REQ_LOCK:
+        _CB_CONTADOR[0] += 1
+        n = _CB_CONTADOR[0]
+    saida = []
+    for c in valor:
+        if c.isalpha():
+            saida.append(c.upper() if (n & 1) else c.lower())
+            n >>= 1
+        else:
+            saida.append(c)
+    return "".join(saida)
+
+def tibia_com_get(params):
+    # Rota direta primeiro (a mais rápida); o proxy é só a reserva quando a direta
+    # falha (403/erro de rede), pois sai por outro IP mas custa ~15x mais tempo.
+    # Falha da 1ª rota resgatada pela reserva não gera aviso; só loga se as duas falharem.
+    rotas = [False, True] if _OPENER_PROXY else [False, False]
+    falhas = []
+    for usar_proxy in rotas:
+        p = dict(params)
+        for chave in ("name", "GuildName"):
+            if chave in p:
+                p[chave] = _variar_caixa(p[chave])
+        url = TIBIA_COM_BASE + urllib.parse.urlencode(p)
+        req = urllib.request.Request(url, headers={"User-Agent": TIBIA_UA, "Accept": "text/html"})
+
+        origem = f"via proxy {PROXY_TIBIA}" if usar_proxy else "direto (sem proxy)"
+        if not usar_proxy:
+            _aguardar_vez()
+
+        try:
+            return _abrir_requisicao(req, usar_proxy).decode("utf-8", "ignore")
+        except urllib.error.HTTPError as e:
+            falhas.append(f"{origem}: HTTP {e.code} ({e.reason})")
+        except Exception as e:
+            falhas.append(f"{origem}: {e}")
+
+    _registrar_erro_tibia()
+    log(f"[AVISO] Falha ao consultar a tibia.com ({params}) nas duas rotas: {' | '.join(falhas)}",
+        so_console=True)
+    return None
+
+def _limpar_html(trecho):
+    return re.sub(r"<[^>]+>", "", trecho).replace("&#160;", " ").replace("\xa0", " ").strip()
+
+def _parse_data_tibia(txt):
+    m = re.match(r"([A-Za-z]{3})\s+(\d{1,2})\s+(\d{4}),\s+(\d{2}):(\d{2}):(\d{2})\s+(CES?T)", txt)
+    if not m:
+        return None
+    mes = _MESES_TIBIA.get(m.group(1))
+    if not mes:
+        return None
+    offset = 2 if m.group(7) == "CEST" else 1
+    local = datetime(int(m.group(3)), mes, int(m.group(2)),
+                     int(m.group(4)), int(m.group(5)), int(m.group(6)))
+    return (local - timedelta(hours=offset)).replace(tzinfo=timezone.utc)
+
+_MEMBRO_RE = re.compile(
+    r'name=[^"]*"\s*>([^<]+)</a></td>\s*<td>([^<]*)</td>\s*<td>(\d+)</td>\s*<td>[^<]*</td>\s*'
+    r"<td class=['\"]onlinestatus['\"]>(.*?)</td>", re.I | re.S)
+
+def buscar_guild(nome_guild):
+    html = tibia_com_get({"subtopic": "guilds", "page": "view", "GuildName": nome_guild})
+    if html is None:
+        return None, None, []
+    if "was not found" in html:
+        return False, None, []
+
+    wm = re.search(r"founded on ([A-Za-z]+) on ", html)
+    world = wm.group(1).strip() if wm else None
+
+    membros = []
+    for nome_m, voc, lvl, status in _MEMBRO_RE.findall(html):
+        membros.append({
+            "name": nome_m.replace("&#160;", " ").replace("\xa0", " ").strip(),
+            "vocation": voc.strip(),
+            "level": int(lvl),
+            "status": "online" if "online" in status.lower() else "offline",
+        })
+
+    if not membros and world is None:
+        return None, None, []
+    return True, world, membros
+
+def _extrair_primeiro_matador(desc_html):
+    m = re.search(r"\bby\s+(.*?)\.\s*$", desc_html, re.S)
+    if not m:
+        return None
+    resto = m.group(1)
+
+    am = re.match(r'\s*<a[^>]*name=([^"&]+)[^>]*>(.*?)</a>', resto, re.S)
+    if am:
+        return {"nome": _limpar_html(am.group(2)), "e_jogador": True}
+
+    tm = re.match(r"\s*(?:an?\s+)?([^,<]+?)(?:,|\s+and\s|$)", resto)
+    if tm:
+        nome = _limpar_html(tm.group(1)).strip()
+        return {"nome": nome, "e_jogador": False} if nome else None
+    return None
+
+def buscar_mortes_personagem(nome_char):
+    html = tibia_com_get({"subtopic": "characters", "name": nome_char})
+    if html is None:
+        return []
+
+    i = html.find("Character Deaths")
+    if i == -1:
+        return []
+    fim = html.find("</table>", i)
+    bloco = html[i:fim if fim != -1 else None]
+
+    resultado = []
+    for md, desc in re.findall(r'<td[^>]*valign="top"[^>]*>(.*?)</td>\s*<td>(.*?)</td>',
+                               bloco, re.S | re.I):
+        dt = _parse_data_tibia(_limpar_html(md))
+        if not dt:
+            continue
+        lm = re.search(r"at Level (\d+)", _limpar_html(desc))
+        resultado.append({
+            "time": dt.isoformat().replace("+00:00", "Z"),
+            "level": int(lm.group(1)) if lm else 0,
+            "matador": _extrair_primeiro_matador(desc),
+        })
+    return resultado
+
+CATEGORIAS_CANAIS = {
+    "hunted": NOME_CANAL_HUNTED,
+    "friend": NOME_CANAL_FRIEND,
+}
+
+def garantir_canais(conn):
+    res = conn.cmd("channellist")
+    dados = res.split("error id=")[0].strip()
+
+    lista = []
+    for canal in (dados.split("|") if dados else []):
+        atributos = {}
+        for item in canal.split(" "):
+            if "=" in item:
+                chave, valor = item.split("=", 1)
+                atributos[chave] = valor
+        cid = atributos.get("cid")
+        nome = atributos.get("channel_name", "").replace(r"\s", " ")
+        if cid and nome:
+            lista.append((cid, nome))
+
+    cids_existentes = {cid for cid, _ in lista}
+
+    with DADOS_LOCK:
+        for categoria, base in CATEGORIAS_CANAIS.items():
+            atual = DADOS["channels"].get(categoria)
+            if atual and atual in cids_existentes:
+                continue
+
+            achado = next((cid for cid, nome in lista if base in nome), None)
+            if achado:
+                DADOS["channels"][categoria] = achado
+                continue
+
+            log(f"[INFO] Canal '{base}' não encontrado. Criando...")
+            resposta = conn.cmd(
+                f"channelcreate channel_name={escapar_ts(base)} channel_flag_permanent=1"
+            )
+            cid = None
+            for token in resposta.replace("\r", " ").replace("\n", " ").split(" "):
+                if token.startswith("cid="):
+                    cid = token.split("=", 1)[1]
+                    break
+            if cid:
+                DADOS["channels"][categoria] = cid
+                log(f"[OK] Canal '{base}' criado (cid={cid}).")
+            else:
+                log(f"[ERRO] Falha ao criar o canal '{base}'.")
+        salvar_dados()
+
+GRUPOS_VOCACAO = [
+    ("druid", "Druids", "#2e9e5b"),
+    ("sorcerer", "Sorcerers", "#7b57d1"),
+    ("paladin", "Paladins", "#d98a2b"),
+    ("knight", "Knights", "#d13b3b"),
+    ("monk", "Monks", "#2b8ad9"),
+]
+ROTULO_OUTROS = "Outros"
+COR_OUTROS = "#9aa0a6"
+
+TAMANHO_FONTE_DESC = 9
+
+def _grupo_vocacao(vocacao):
+    v = (vocacao or "").lower()
+    for chave, rotulo, cor in GRUPOS_VOCACAO:
+        if chave in v:
+            return rotulo, cor
+    return ROTULO_OUTROS, COR_OUTROS
+
+def _fmt_tempo_online(delta):
+    total_min = max(0, int(delta.total_seconds() // 60))
+    horas, minutos = divmod(total_min, 60)
+    return f"{horas:02d}:{minutos:02d}"
+
+def _envolver_descricao(texto):
+    if TAMANHO_FONTE_DESC:
+        return f"[size={TAMANHO_FONTE_DESC}]{texto}[/size]"
+    return texto
+
+def _formatar_descricao(categoria, guilds_por_membros):
+    with DADOS_LOCK:
+        mundo = DADOS.get("world") or "?"
+
+    online = []
+    total = 0
+    for membros in guilds_por_membros.values():
+        total += len(membros)
+        online.extend(m for m in membros if m["status"] == "online")
+
+    linhas = [f"[b][{mundo}] {len(online)}/{total} online[/b]", ""]
+
+    if not guilds_por_membros:
+        linhas.append("[i]Nenhuma guild cadastrada nesta lista.[/i]")
+        return _envolver_descricao("\n".join(linhas))
+    if not online:
+        linhas.append("[i]Ninguém online no momento.[/i]")
+        return _envolver_descricao("\n".join(linhas))
+
+    grupos = {}
+    for m in online:
+        rotulo, cor = _grupo_vocacao(m["vocation"])
+        grupos.setdefault(rotulo, {"cor": cor, "membros": []})["membros"].append(m)
+
+    def cabe(linha_extra):
+
+        candidato = _envolver_descricao("\n".join(linhas + [linha_extra]))
+        return len(escapar_ts(candidato).encode("utf-8")) <= MAX_DESC_BYTES
+
+    truncado = False
+    ordem = [rotulo for _, rotulo, _ in GRUPOS_VOCACAO] + [ROTULO_OUTROS]
+    for rotulo in ordem:
+        if rotulo not in grupos:
+            continue
+        cor = grupos[rotulo]["cor"]
+        membros = sorted(grupos[rotulo]["membros"], key=lambda x: x["level"], reverse=True)
+        cabecalho = f"[b][color={cor}]{rotulo} ({len(membros)})[/color][/b]"
+        if not cabe(cabecalho):
+            truncado = True
+            break
+        linhas.append(cabecalho)
+        for m in membros:
+            tempo = m.get("tempo_online", "--:--")
+            linha = f"[{tempo}] [color=green]●[/color] [b]{m['level']}[/b] {m['name']}"
+            if not cabe(linha):
+                truncado = True
+                break
+            linhas.append(linha)
+        if truncado:
+            break
+        linhas.append("")
+
+    if truncado:
+        linhas.append("[i]... lista truncada (limite do TeamSpeak).[/i]")
+
+    return _envolver_descricao("\n".join(linhas))
+
+def _atualizar_online_desde(membros_por_guild):
+    agora = datetime.now(timezone.utc)
+    online_agora = set()
+    for membros in membros_por_guild.values():
+        for m in membros:
+            if m["status"] == "online":
+                online_agora.add(m["name"])
+                inicio = ONLINE_DESDE.setdefault(m["name"], agora)
+                m["tempo_online"] = _fmt_tempo_online(agora - inicio)
+
+    for nome in list(ONLINE_DESDE):
+        if nome not in online_agora:
+            del ONLINE_DESDE[nome]
+
+def atualizar_descricoes_canais(conn, membros_por_guild):
+    _atualizar_online_desde(membros_por_guild)
+
+    with DADOS_LOCK:
+        guilds = dict(DADOS["guilds"])
+        canais = dict(DADOS["channels"])
+
+    por_categoria = {"hunted": {}, "friend": {}}
+    for nome_guild, categoria in guilds.items():
+        if categoria in por_categoria:
+            por_categoria[categoria][nome_guild] = membros_por_guild.get(nome_guild, [])
+
+    for categoria, guilds_membros in por_categoria.items():
+        cid = canais.get(categoria)
+        if not cid:
+            continue
+
+        online_count = sum(1 for mm in guilds_membros.values()
+                           for m in mm if m["status"] == "online")
+        nome_base = f"{CATEGORIAS_CANAIS[categoria]} ({online_count})"
+        deco = DECORACAO_NOME_CANAL
+        nome_decorado = f"{deco} {nome_base} {deco}" if deco else nome_base
+        novo_nome = f"{ALINHAMENTO_NOME_CANAL}{nome_decorado}"
+        descricao = _formatar_descricao(categoria, guilds_membros)
+
+        anterior = ULTIMO_ESTADO_CANAL.get(categoria)
+        if anterior == (novo_nome, descricao):
+            continue
+
+        if not anterior or anterior[0] != novo_nome:
+            conn.cmd(f"channeledit cid={cid} channel_name={escapar_ts(novo_nome)}")
+
+        if not anterior or anterior[1] != descricao:
+            conn.cmd(f"channeledit cid={cid} channel_description={escapar_ts(descricao)}")
+
+        ULTIMO_ESTADO_CANAL[categoria] = (novo_nome, descricao)
+
+def _hora_morte_para_ordenacao(iso_time):
+    try:
+        return datetime.fromisoformat(iso_time.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+# Limite real do TeamSpeak (TS3_MAX_SIZE_POKE_MESSAGE) para o "msg" do clientpoke: 100 bytes UTF-8.
+# O BBCode do link ("[url=https://www.tibia.com/community/?subtopic=characters&name=...]...[/url]")
+# já consome ~70 bytes fixos sozinho, então a cor/rótulo/guild/matador vão sendo descartados nessa
+# ordem até caber; o link do morto é o que tentamos preservar por mais tempo.
+LIMITE_MSG_POKE = 100
+
+def _cabe(texto):
+    return len(texto.encode("utf-8")) <= LIMITE_MSG_POKE
+
+def _link_personagem(nome):
+    url = "https://www.tibia.com/community/?subtopic=characters&name=" + urllib.parse.quote(nome)
+    return f"[url={url}]{nome}[/url]"
+
+def _montar_msg_morte(cor, rotulo, rotulo_curto, nome_char, nivel, nome_guild, matador):
+    link_morto = _link_personagem(nome_char)
+
+    texto_matador = f" por {matador['nome']}" if matador else ""
+    texto_matador_link = (f" por {_link_personagem(matador['nome'])}"
+                           if matador and matador["e_jogador"] else texto_matador)
+
+    # Do mais completo ao mais enxuto. Prioridade de descarte (o que sai primeiro): cor > guild >
+    # rótulo (encurta, depois some) > nível > o link em si (só cai pro nome puro em último caso).
+    # O matador é mantido o máximo possível: cor/rótulo/guild vão embora ANTES dele.
+    candidatos = [
+        f"[color={cor}]☠ {rotulo}: {link_morto} (Lvl {nivel}) - {nome_guild}{texto_matador_link}[/color]",
+        f"[color={cor}]☠ {rotulo}: {link_morto} (Lvl {nivel}) - {nome_guild}{texto_matador}[/color]",
+        f"☠ {rotulo}: {link_morto} (Lvl {nivel}) - {nome_guild}{texto_matador}",
+        f"☠ {rotulo}: {link_morto} (Lvl {nivel}){texto_matador}",
+        f"☠ {rotulo_curto}: {link_morto} (Lvl {nivel}){texto_matador}",
+        f"{link_morto} (Lvl {nivel}){texto_matador}",
+        f"{link_morto}{texto_matador}",
+        # A partir daqui, desiste do matador (não coube nem sem rótulo/nível/guild).
+        f"☠ {rotulo}: {link_morto} (Lvl {nivel}) - {nome_guild}",
+        f"☠ {rotulo_curto}: {link_morto} (Lvl {nivel})",
+        f"{link_morto} (Lvl {nivel})",
+        link_morto,
+        # Nome longo demais para caber como link dentro do limite: cai pro texto puro (com contexto).
+        f"[color={cor}]☠ {rotulo}: {nome_char} (Lvl {nivel}) - {nome_guild}{texto_matador}[/color]",
+        f"☠ {rotulo}: {nome_char} (Lvl {nivel}) - {nome_guild}{texto_matador}",
+        f"☠ {rotulo_curto}: {nome_char} (Lvl {nivel})",
+    ]
+    for candidato in candidatos:
+        if _cabe(candidato):
+            return candidato
+    return candidatos[-1].encode("utf-8")[:LIMITE_MSG_POKE].decode("utf-8", "ignore")
+
+def _registrar_ciclo_sem_erros(erros_antes, qtd_guilds, qtd_personagens):
+    if _ERROS_TIBIA_CICLO[0] == erros_antes:
+        log(f"[CICLO] Busca na tibia.com concluída sem erros: {qtd_guilds} guild(s) "
+            f"e {qtd_personagens} personagem(ns) online verificado(s).", so_console=True)
+
+def _processar_ciclo_tibia(conn):
+    with DADOS_LOCK:
+        guilds = dict(DADOS["guilds"])
+
+    if not guilds:
+        return
+
+    erros_antes = _ERROS_TIBIA_CICLO[0]
+
+    membros_por_guild = {}
+    online_por_guild = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_BUSCAS_PARALELAS) as pool:
+        futuros_guild = {pool.submit(buscar_guild, nome_guild): nome_guild for nome_guild in guilds}
+        for futuro in concurrent.futures.as_completed(futuros_guild):
+            nome_guild = futuros_guild[futuro]
+            try:
+                existe, _world, membros = futuro.result()
+            except Exception:
+                existe, membros = False, []
+            if existe:
+                membros_por_guild[nome_guild] = membros
+                online_por_guild[nome_guild] = [
+                    m["name"] for m in membros
+                    if m["status"] == "online" and m["level"] >= NIVEL_MINIMO_MONITORAR_MORTE
+                ]
+            else:
+                membros_por_guild[nome_guild] = []
+                online_por_guild[nome_guild] = []
+
+    atualizar_descricoes_canais(conn, membros_por_guild)
+
+    alvos = []
+    for nome_guild, categoria in guilds.items():
+        if categoria not in ("friend", "hunted"):
+            continue
+        for nome_char in online_por_guild.get(nome_guild, []):
+            alvos.append((nome_char, nome_guild, categoria))
+
+    if not alvos:
+        _registrar_ciclo_sem_erros(erros_antes, len(guilds), 0)
+        return
+
+    mortes_por_char = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_BUSCAS_PARALELAS) as pool:
+        futuros = {pool.submit(buscar_mortes_personagem, nome): nome
+                   for nome, _g, _c in alvos}
+        for futuro in concurrent.futures.as_completed(futuros):
+            try:
+                mortes_por_char[futuros[futuro]] = futuro.result()
+            except Exception:
+                mortes_por_char[futuros[futuro]] = []
+
+    for nome_char, nome_guild, categoria in alvos:
+        mortes = mortes_por_char.get(nome_char) or []
+        if not mortes:
+            continue
+
+        morte_recente = max(mortes, key=lambda d: _hora_morte_para_ordenacao(d["time"]))
+        ts_recente = morte_recente["time"]
+
+        with DADOS_LOCK:
+            ja_visto = DADOS["seen_deaths"].get(nome_char)
+
+        if ja_visto is None:
+            with DADOS_LOCK:
+                DADOS["seen_deaths"][nome_char] = ts_recente
+                salvar_dados()
+            continue
+
+        if _hora_morte_para_ordenacao(ts_recente) > _hora_morte_para_ordenacao(ja_visto):
+            with DADOS_LOCK:
+                DADOS["seen_deaths"][nome_char] = ts_recente
+                salvar_dados()
+
+            idade = datetime.now(timezone.utc) - _hora_morte_para_ordenacao(ts_recente)
+            if idade.total_seconds() > JANELA_MORTE_RECENTE_SEGUNDOS:
+                log(f"[MORTE] {nome_char} ({categoria}) morreu há {int(idade.total_seconds() // 60)} min; "
+                      "muito antiga para anunciar, ignorando.")
+                continue
+
+            if categoria == "friend":
+                cor, rotulo, rotulo_curto = "red", "ALIADO MORTO", "ALIADO"
+            else:
+                cor, rotulo, rotulo_curto = "green", "INIMIGO MORTO", "INIMIGO"
+            msg = _montar_msg_morte(cor, rotulo, rotulo_curto, nome_char, morte_recente["level"],
+                                     nome_guild, morte_recente.get("matador"))
+            log(f"[MORTE] {nome_char} ({categoria}) morreu. Disparando aviso...")
+            mass_poke_sistema(conn, msg)
+
+    _registrar_ciclo_sem_erros(erros_antes, len(guilds), len(alvos))
+
+def worker_tibia(conn, parar_evt):
+    # Compartilha a Conexao do loop principal: as buscas/edições saem via WebQuery (HTTP,
+    # sem estado) e os pokes de morte saem pelo telnet ouvinte (thread-safe via lock),
+    # para que respostas aos pokes cheguem ao bot como comandos.
+    log("[OK] Worker de mortes/hunted list iniciado.")
+    try:
+        while not parar_evt.is_set():
+            try:
+                _processar_ciclo_tibia(conn)
+            except Exception as e:
+                log(f"[AVISO] Erro no ciclo do worker de mortes: {e}")
+
+            REFRESH_EVENT.clear()
+
+            REFRESH_EVENT.wait(timeout=PAUSA_ENTRE_CICLOS)
+    finally:
+        log("[INFO] Worker de mortes encerrado.")
+
+def _cadastrar_guild(conn, clid, categoria, nome_guild):
+    nome_guild = nome_guild.strip()
+    if not nome_guild:
+        enviar_mensagem_privada(conn, clid, "Uso: informe o nome da guild após o comando.")
+        return
+
+    existe, world, _membros = buscar_guild(nome_guild)
+    if existe is None:
+        enviar_mensagem_privada(conn, clid, "Não consegui consultar a TibiaData agora. Tente novamente em instantes.")
+        return
+    if existe is False:
+        enviar_mensagem_privada(conn, clid, f"A guild '{nome_guild}' não foi encontrada no Tibia.")
+        return
+
+    rotulo = {"friend": "ALIADA", "hunted": "INIMIGA", "neutral": "NEUTRA"}[categoria]
+    with DADOS_LOCK:
+        DADOS["guilds"][nome_guild] = categoria
+        if not DADOS["world"] and world:
+            DADOS["world"] = world
+        salvar_dados()
+
+    REFRESH_EVENT.set()
+    log(f"[COMANDO] Guild '{nome_guild}' cadastrada como {rotulo}.")
+    enviar_mensagem_privada(conn, clid, f"Guild '{nome_guild}' cadastrada como {rotulo}. Os canais serão atualizados em instantes.")
+
+def _remover_guild(conn, clid, nome_guild):
+    nome_guild = nome_guild.strip()
+    with DADOS_LOCK:
+        removida = DADOS["guilds"].pop(nome_guild, None)
+        if removida is not None:
+            salvar_dados()
+
+    if removida is None:
+        enviar_mensagem_privada(conn, clid, f"A guild '{nome_guild}' não estava cadastrada.")
+        return
+
+    REFRESH_EVENT.set()
+    log(f"[COMANDO] Guild '{nome_guild}' removida.")
+    enviar_mensagem_privada(conn, clid, f"Guild '{nome_guild}' removida das listas.")
+
+def _definir_mundo(conn, clid, mundo):
+    mundo = mundo.strip()
+    if not mundo:
+        enviar_mensagem_privada(conn, clid, "Uso: !server NomeDoMundo (ex: !server Antica)")
+        return
+    with DADOS_LOCK:
+        DADOS["world"] = mundo
+        salvar_dados()
+    log(f"[COMANDO] Mundo definido: {mundo}")
+    enviar_mensagem_privada(conn, clid, f"Mundo definido como '{mundo}'.")
+
+def _listar_config(conn, clid):
+    with DADOS_LOCK:
+        mundo = DADOS["world"] or "(não definido)"
+        guilds = dict(DADOS["guilds"])
+
+    rotulos = {"friend": "Aliadas", "hunted": "Inimigas", "neutral": "Neutras"}
+    partes = [f"Mundo: {mundo}"]
+    for categoria, rotulo in rotulos.items():
+        nomes = [g for g, c in guilds.items() if c == categoria]
+        partes.append(f"{rotulo}: {', '.join(nomes) if nomes else '(nenhuma)'}")
+    enviar_mensagem_privada(conn, clid, " | ".join(partes))
+
+def _aplicar_permissoes_canal(conn, cid, permissoes):
+    for permsid, valor in permissoes.items():
+        conn.cmd(f"channeladdperm cid={cid} permsid={permsid} permvalue={valor}")
+
+def _criar_canal_estrutura(conn, nome, permissoes, ordem_apos):
+    ordem = ordem_apos if ordem_apos is not None else "0"
+    resposta = conn.cmd(f"channelcreate channel_name={escapar_ts(nome)} "
+                        f"channel_flag_permanent=1 channel_order={ordem}")
+
+    cid = None
+    for token in resposta.replace("\r", " ").replace("\n", " ").split(" "):
+        if token.startswith("cid="):
+            cid = token.split("=", 1)[1]
+            break
+
+    if cid:
+        _aplicar_permissoes_canal(conn, cid, permissoes)
+    return cid
+
+def processar_criar_estrutura_canais(conn, clid_remetente, nick_remetente):
+    log(f"\n[COMANDO PRIVADO] {nick_remetente} solicitou !createchannels (reconstrução total dos canais).")
+
+    res = conn.cmd("channellist -flags")
+    dados = res.split("error id=")[0].strip()
+
+    canais = []
+    cid_default = None
+    for canal in (dados.split("|") if dados else []):
+        atributos = {}
+        for item in canal.split(" "):
+            if "=" in item:
+                chave, valor = item.split("=", 1)
+                atributos[chave] = valor
+        cid = atributos.get("cid")
+        if cid:
+            canais.append(cid)
+            if atributos.get("channel_flag_default") == "1":
+                cid_default = cid
+
+    if not cid_default:
+        log("[ERRO] Não foi possível identificar o canal padrão do servidor. !createchannels abortado.")
+        enviar_mensagem_privada(conn, clid_remetente,
+                                 "Não consegui identificar o canal padrão do servidor. Operação cancelada.")
+        return
+
+    res = conn.cmd("clientlist")
+    dados_clientes = res.split("error id=")[0].strip()
+    for usuario in (dados_clientes.split("|") if dados_clientes else []):
+        atributos = {}
+        for item in usuario.split(" "):
+            if "=" in item:
+                chave, valor = item.split("=", 1)
+                atributos[chave] = valor
+        if atributos.get("client_type") == "0" and atributos.get("cid") != cid_default:
+            conn.cmd(f"clientmove clid={atributos.get('clid')} cid={cid_default}")
+
+    log(f"[OK] Utilizadores movidos para o canal padrão (cid={cid_default}).")
+
+    for cid in canais:
+        if cid == cid_default:
+            continue
+        conn.cmd(f"channeldelete cid={cid} force=1")
+
+    log(f"[OK] {len(canais) - 1} canal(is) removido(s).")
+
+    permissoes_spacer = dict(PERMISSOES_ESTRUTURA_CANAIS)
+    permissoes_canal = dict(PERMISSOES_ESTRUTURA_CANAIS)
+    permissoes_canal["i_channel_needed_description_view_power"] = 1
+    barra = DECORACAO_NOME_CANAL * 16
+
+    ordem = None
+    for nome_canal_extra in ("Admin Room", "Rules", "WhatsApp Group", "Tibia Map", "Imbuements"):
+        ordem = _criar_canal_estrutura(conn, nome_canal_extra, permissoes_canal, ordem)
+
+    ordem = _criar_canal_estrutura(conn, f"[cspacer]{barra}", permissoes_spacer, ordem)
+    cid_hunted = _criar_canal_estrutura(
+        conn, f"{ALINHAMENTO_NOME_CANAL}{DECORACAO_NOME_CANAL} {NOME_CANAL_HUNTED} {DECORACAO_NOME_CANAL}",
+        permissoes_canal, ordem)
+    ordem = _criar_canal_estrutura(conn, f"[cspacer1]{barra}", permissoes_spacer, cid_hunted)
+    cid_friend = _criar_canal_estrutura(
+        conn, f"{ALINHAMENTO_NOME_CANAL}{DECORACAO_NOME_CANAL} {NOME_CANAL_FRIEND} {DECORACAO_NOME_CANAL}",
+        permissoes_canal, ordem)
+    ordem = _criar_canal_estrutura(conn, f"[cspacer3]{barra}", permissoes_spacer, cid_friend)
+    _criar_canal_estrutura(conn, "[cspacer1]", permissoes_spacer, ordem)
+
+    if cid_hunted:
+        conn.cmd(f"channelmove cid={cid_default} cpid={cid_hunted} order=0")
+    conn.cmd(f"channelmove cid={cid_default} cpid=0 order=0")
+
+    if not cid_hunted or not cid_friend:
+        log("[ERRO] Falha ao criar o canal Hunted List e/ou Friend List.")
+        enviar_mensagem_privada(conn, clid_remetente,
+                                 "A estrutura foi recriada, mas houve falha ao criar Hunted List e/ou Friend List. Verifique manualmente.")
+        return
+
+    with DADOS_LOCK:
+        DADOS["channels"]["hunted"] = cid_hunted
+        DADOS["channels"]["friend"] = cid_friend
+        salvar_dados()
+    ULTIMO_ESTADO_CANAL.pop("hunted", None)
+    ULTIMO_ESTADO_CANAL.pop("friend", None)
+    REFRESH_EVENT.set()
+
+    log(f"[SUCESSO] Estrutura de canais recriada por {nick_remetente}.")
+    enviar_mensagem_privada(conn, clid_remetente,
+                             "Estrutura de canais recriada com sucesso! Hunted List e Friend List serão atualizados em instantes.")
+
+def processar_criar_grupos_hierarquia(conn, clid_remetente, nick_remetente):
+    log(f"\n[COMANDO PRIVADO] {nick_remetente} solicitou !creategroups (reconstrução total dos server groups).")
+
+    garantir_permissoes_proprias(conn)
+
+    res = conn.cmd("servergrouplist")
+    dados = res.split("error id=")[0].strip()
+
+    grupos_existentes = []
+    for grupo in (dados.split("|") if dados else []):
+        atributos = {}
+        for item in grupo.split(" "):
+            if "=" in item:
+                chave, valor = item.split("=", 1)
+                atributos[chave] = valor
+        sgid = atributos.get("sgid")
+        nome = atributos.get("name", "").replace(r"\s", " ")
+        if sgid and atributos.get("type") == "1":
+            grupos_existentes.append((sgid, nome))
+
+    apagados = 0
+    for sgid, nome in grupos_existentes:
+        if nome in GRUPOS_PROTEGIDOS_CRIAR_GRUPOS:
+            continue
+        resposta = conn.cmd(f"servergroupdel sgid={sgid} force=1")
+        if "error id=0" in resposta:
+            apagados += 1
+            log(f"[OK] Server group '{nome}' (sgid={sgid}) removido.")
+        else:
+            log(f"[AVISO] Falha ao remover o server group '{nome}' (sgid={sgid}): {resposta.strip()}")
+
+    log(f"[OK] {apagados} server group(s) removido(s). Preservados: "
+        f"{', '.join(sorted(GRUPOS_PROTEGIDOS_CRIAR_GRUPOS))}.")
+
+    sgids_prontos = {}
+    total_perms_aplicadas = 0
+    total_perms_esperadas = 0
+    for nome_grupo in ORDEM_HIERARQUIA:
+        sgid = _buscar_ou_criar_grupo(conn, nome_grupo)
+        if not sgid:
+            log(f"[ERRO] Falha ao criar/localizar o server group '{nome_grupo}'.")
+            continue
+        permissoes = PERMISSOES_HIERARQUIA.get(nome_grupo, {})
+        aplicadas = aplicar_permissoes_grupo(conn, sgid, permissoes)
+        total_perms_aplicadas += aplicadas
+        total_perms_esperadas += len(permissoes)
+        sgids_prontos[nome_grupo] = sgid
+        log(f"[OK] Server group '{nome_grupo}' (sgid={sgid}): {aplicadas}/{len(permissoes)} permissão(ões) aplicada(s).")
+
+    if NOME_GRUPO_SERVER_ADMIN in sgids_prontos:
+        global SERVER_ADMIN_SGID
+        SERVER_ADMIN_SGID = sgids_prontos[NOME_GRUPO_SERVER_ADMIN]
+
+    if NOME_GRUPO_EDITOR in sgids_prontos:
+        global EDITOR_SGID
+        EDITOR_SGID = sgids_prontos[NOME_GRUPO_EDITOR]
+
+    # TSBot/TSBot Admin não estão na lista de protegidos, então !creategroups também os apaga.
+    # Recria os dois na hora pra !mp/!mm/!mk não ficarem quebrados até o bot reconectar.
+    global TSBOT_SGID, TSBOT_ADMIN_SGID
+    TSBOT_SGID = garantir_grupo(conn, NOME_GRUPO_TSBOT, PODER_NECESSARIO_GRUPO_TSBOT)
+    TSBOT_ADMIN_SGID = garantir_grupo(conn, NOME_GRUPO_TSBOT_ADMIN, PODER_NECESSARIO_GRUPO_TSBOT_ADMIN)
+
+    aviso_permissoes = ""
+    if total_perms_aplicadas < total_perms_esperadas:
+        aviso_permissoes = (f" ATENÇÃO: só {total_perms_aplicadas}/{total_perms_esperadas} permissões foram "
+                            "aceitas pelo servidor (veja os avisos no log) — o bot pode não ter poder "
+                            "suficiente; pode ser necessário elevar o login ServerQuery manualmente.")
+
+    log(f"[SUCESSO] Hierarquia de server groups recriada por {nick_remetente}. "
+        f"Permissões aplicadas: {total_perms_aplicadas}/{total_perms_esperadas}.")
+    enviar_mensagem_privada(
+        conn, clid_remetente,
+        f"Hierarquia recriada: {apagados} grupo(s) antigo(s) removido(s), "
+        f"{len(sgids_prontos)}/{len(ORDEM_HIERARQUIA)} grupo(s) configurado(s), "
+        f"{total_perms_aplicadas}/{total_perms_esperadas} permissões aplicadas "
+        f"({', '.join(ORDEM_HIERARQUIA)}).{aviso_permissoes}"
+    )
+
+def _buscar_client_database_id(conn, clid):
+    res = conn.cmd(f"clientinfo clid={clid}")
+    dados = res.split("error id=")[0].strip()
+    for item in dados.split(" "):
+        if item.startswith("client_database_id="):
+            return item.split("=", 1)[1]
+    return None
+
+def processar_recuperar_editor(conn, clid_remetente, nick_remetente):
+    log(f"\n[COMANDO PRIVADO] {nick_remetente} usou !recoveredit (recuperação de acesso Editor).")
+
+    garantir_permissoes_proprias(conn)
+
+    cldbid = _buscar_client_database_id(conn, clid_remetente)
+    if not cldbid:
+        log(f"[ERRO] !recoveredit: não foi possível obter o client_database_id de clid={clid_remetente}.")
+        enviar_mensagem_privada(conn, clid_remetente, "Falha ao identificar sua conta. Operação cancelada.")
+        return
+
+    sgid = _buscar_ou_criar_grupo(conn, NOME_GRUPO_EDITOR)
+    if not sgid:
+        log("[ERRO] !recoveredit: falha ao localizar/criar o server group 'Editor'.")
+        enviar_mensagem_privada(conn, clid_remetente, "Falha ao preparar o grupo Editor. Operação cancelada.")
+        return
+
+    aplicar_permissoes_grupo(conn, sgid, PERMISSOES_HIERARQUIA.get(NOME_GRUPO_EDITOR, {}))
+
+    resposta = conn.cmd(f"servergroupaddclient sgid={sgid} cldbid={cldbid}")
+    if "error id=0" not in resposta:
+        log(f"[ERRO] !recoveredit: falha ao atribuir o grupo Editor a {nick_remetente}: {resposta.strip()}")
+        enviar_mensagem_privada(conn, clid_remetente, "Falha ao atribuir o grupo Editor. Verifique o log.")
+        return
+
+    log(f"[SUCESSO] !recoveredit: grupo Editor atribuído a {nick_remetente} (cldbid={cldbid}, sgid={sgid}).")
+    enviar_mensagem_privada(conn, clid_remetente, "Grupo Editor atribuído à sua conta com sucesso.")
+
+def processar_comando_guerra(conn, mensagem, clid_remetente):
+    if mensagem.startswith("!aliado "):
+        _cadastrar_guild(conn, clid_remetente, "friend", mensagem[len("!aliado "):])
+    elif mensagem.startswith("!inimigo "):
+        _cadastrar_guild(conn, clid_remetente, "hunted", mensagem[len("!inimigo "):])
+    elif mensagem.startswith("!neutro "):
+        _cadastrar_guild(conn, clid_remetente, "neutral", mensagem[len("!neutro "):])
+    elif mensagem.startswith("!remover "):
+        _remover_guild(conn, clid_remetente, mensagem[len("!remover "):])
+    elif mensagem.startswith("!server "):
+        _definir_mundo(conn, clid_remetente, mensagem[len("!server "):])
+    elif mensagem.strip() == "!listar":
+        _listar_config(conn, clid_remetente)
+    else:
+        return False
+    return True
+
+class ErroConfiguracao(Exception):
+    pass
+
+def conectar_query():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((TS_HOST, TS_PORT))
+    time.sleep(0.2)
+    sock.recv(4096)
+
+    # Login com credenciais autoprovisionadas via API-KEY. As credenciais são reaproveitadas
+    # entre as conexões do mesmo processo (principal + worker); se o login for recusado
+    # (ex: removido no servidor), reprovisiona uma única vez e tenta de novo.
+    with _CRED_QUERY_LOCK:
+        for tentativa in (1, 2):
+            if _CRED_QUERY[0] is None:
+                _CRED_QUERY[0] = _provisionar_login_query()
+            login, senha = _CRED_QUERY[0]
+            sock.sendall(
+                f"login client_login_name={login} client_login_password={senha}\n".encode('utf-8')
+            )
+            if "error id=0" in ler_resposta_comando(sock):
+                break
+            _CRED_QUERY[0] = None
+            if tentativa == 2:
+                raise ErroConfiguracao(
+                    "Falha na autenticação do ServerQuery mesmo após reprovisionar o login via API-KEY."
+                )
+
+    sock.sendall(f"use sid={VIRTUAL_SERVER_ID}\n".encode('utf-8'))
+    if "id=0" not in ler_resposta_comando(sock):
+        raise ErroConfiguracao(f"Falha ao selecionar o servidor virtual ID {VIRTUAL_SERVER_ID}.")
+
+    conn = Conexao(sock)
+
+    # O login recém-criado nasce sem poder nenhum (nível guest): antes de qualquer outro comando
+    # (inclusive servernotifyregister), garante o grupo Admin Server Query via API-KEY.
+    cldbid = _buscar_proprio_cldbid(conn)
+    if not cldbid or not _garantir_admin_server_query(cldbid):
+        conn.fechar()
+        raise ErroConfiguracao(
+            f"Falha ao conceder o grupo {NOME_GRUPO_ADMIN_SERVER_QUERY} ao bot (cldbid={cldbid}) "
+            "via WebQuery. Verifique a API-KEY."
+        )
+
+    return conn
+
+def conectar_e_rodar(primeira_conexao):
+    conn = None
+    worker_thread = None
+    parar_worker = threading.Event()
+    try:
+
+        try:
+            conn = conectar_query()
+        except ErroConfiguracao as e:
+            log(f"[ERRO] {e}")
+            return False
+
+        conn.cmd("clientupdate client_nickname=vBot")
+        log("[OK] Identidade visual definida com sucesso: vBot")
+
+        conn.cmd("servernotifyregister event=server")
+        conn.cmd("servernotifyregister event=textprivate")
+
+        garantir_permissoes_proprias(conn)
+
+        global TSBOT_SGID, TSBOT_ADMIN_SGID, SERVER_ADMIN_SGID, EDITOR_SGID
+        TSBOT_SGID = garantir_grupo(conn, NOME_GRUPO_TSBOT, PODER_NECESSARIO_GRUPO_TSBOT)
+        if not TSBOT_SGID:
+            log("[AVISO] Sem grupo TSBot disponível: !mm e !mk ficarão bloqueados para todos até isso ser corrigido.")
+        TSBOT_ADMIN_SGID = garantir_grupo(conn, NOME_GRUPO_TSBOT_ADMIN, PODER_NECESSARIO_GRUPO_TSBOT_ADMIN)
+        if not TSBOT_ADMIN_SGID:
+            log("[AVISO] Sem grupo TSBot Admin disponível: os comandos de guerra ficarão bloqueados até isso ser corrigido.")
+        SERVER_ADMIN_SGID = _buscar_ou_criar_grupo(conn, NOME_GRUPO_SERVER_ADMIN)
+        EDITOR_SGID = _buscar_ou_criar_grupo(conn, NOME_GRUPO_EDITOR)
+        if not EDITOR_SGID:
+            log("[AVISO] Sem grupo Editor disponível: !createchannels e !creategroups ficarão bloqueados até isso ser corrigido.")
+
+        carregar_dados()
+        garantir_canais(conn)
+
+        # O worker compartilha a mesma Conexao: buscas/edições via WebQuery e pokes pelo
+        # telnet ouvinte (thread-safe). Não existe mais uma segunda sessão de query.
+        worker_thread = threading.Thread(
+            target=worker_tibia, args=(conn, parar_worker), daemon=True
+        )
+        worker_thread.start()
+
+        if primeira_conexao:
+            enviar_mensagem_para_todos(conn, TEXTO_BOAS_VINDAS)
+        else:
+            enviar_mensagem_para_todos(conn, "vBot reconectado")
+
+        log("\n[ONLINE] vBot está ativo, monitorando o servidor e aguardando comandos!")
+        log("-" * 60)
+
+        while True:
+            try:
+                linha = conn.eventos.get(timeout=120.0)
+
+                if linha is None:
+                    log("\n[AVISO] A conexão foi encerrada pelo servidor de TeamSpeak.")
+                    break
+
+                if "notifycliententerview" in linha:
+                    propriedades = {}
+                    for p in linha.split(" "):
+                        if "=" in p:
+                            k, v = p.split("=", 1)
+                            propriedades[k] = v
+
+                    if propriedades.get("client_type") == "0":
+                        clid_novo = propriedades.get("clid")
+                        nome_novo = propriedades.get("client_nickname", "Jogador").replace(r"\s", " ")
+
+                        log(f"[CONEXÃO] '{nome_novo}' entrou no servidor. Enviando mensagem privada...")
+                        enviar_mensagem_privada(conn, clid_novo, TEXTO_BOAS_VINDAS)
+
+                elif "notifyclientleftview" in linha:
+
+                    log("[INFO] Um utilizador alterou o seu estado (saiu do servidor ou mudou de canal).")
+
+                elif "notifytextmessage" in linha:
+                    propriedades = {}
+                    for p in linha.split(" "):
+                        if "=" in p:
+                            k, v = p.split("=", 1)
+                            propriedades[k] = v
+
+                    if propriedades.get("targetmode") == "1":
+                        mensagem_raw = propriedades.get("msg", "").replace(r"\s", " ")
+
+                        if mensagem_raw.startswith("!mp "):
+                            texto_do_poke = mensagem_raw[4:].strip()
+                            clid_remetente = propriedades.get("invokerid")
+                            uid_remetente = desescapar_ts(propriedades.get("invokeruid", ""))
+                            nick_remetente = propriedades.get("invokername", "Alguem").replace(r"\s", " ")
+
+                            processar_mass_poke(conn, texto_do_poke, clid_remetente, uid_remetente, nick_remetente)
+
+                        elif mensagem_raw.startswith("!mm"):
+                            clid_remetente = propriedades.get("invokerid")
+                            nick_remetente = propriedades.get("invokername", "Alguem").replace(r"\s", " ")
+
+                            if remetente_autorizado(conn, clid_remetente, TSBOT_SGID):
+                                processar_mass_move(conn, clid_remetente, nick_remetente)
+                            else:
+                                log(f"[BLOQUEADO] {nick_remetente} tentou usar !mm sem pertencer ao grupo '{NOME_GRUPO_TSBOT}'.")
+                                enviar_mensagem_privada(
+                                    conn, clid_remetente,
+                                    f"Você não tem permissão para usar este comando. Peça a um Server Admin para te adicionar ao grupo {NOME_GRUPO_TSBOT}."
+                                )
+
+                        elif mensagem_raw.startswith("!mk"):
+                            clid_remetente = propriedades.get("invokerid")
+                            nick_remetente = propriedades.get("invokername", "Alguem").replace(r"\s", " ")
+
+                            if remetente_autorizado(conn, clid_remetente, TSBOT_SGID):
+                                processar_mass_kick(conn, clid_remetente, nick_remetente)
+                            else:
+                                log(f"[BLOQUEADO] {nick_remetente} tentou usar !mk sem pertencer ao grupo '{NOME_GRUPO_TSBOT}'.")
+                                enviar_mensagem_privada(
+                                    conn, clid_remetente,
+                                    f"Você não tem permissão para usar este comando. Peça a um Server Admin para te adicionar ao grupo {NOME_GRUPO_TSBOT}."
+                                )
+
+                        elif mensagem_raw.startswith(("!aliado", "!inimigo", "!neutro", "!remover", "!server", "!listar")):
+                            clid_remetente = propriedades.get("invokerid")
+                            nick_remetente = propriedades.get("invokername", "Alguem").replace(r"\s", " ")
+
+                            if remetente_autorizado(conn, clid_remetente, TSBOT_ADMIN_SGID):
+                                if not processar_comando_guerra(conn, mensagem_raw, clid_remetente):
+                                    enviar_mensagem_privada(
+                                        conn, clid_remetente,
+                                        "Comandos: !aliado <guild> | !inimigo <guild> | !neutro <guild> | "
+                                        "!remover <guild> | !server <mundo> | !listar"
+                                    )
+                            else:
+                                log(f"[BLOQUEADO] {nick_remetente} tentou usar um comando de guerra sem pertencer ao grupo '{NOME_GRUPO_TSBOT_ADMIN}'.")
+                                enviar_mensagem_privada(
+                                    conn, clid_remetente,
+                                    f"Você não tem permissão para usar este comando. Peça a um Server Admin para te adicionar ao grupo {NOME_GRUPO_TSBOT_ADMIN}."
+                                )
+
+                        elif mensagem_raw.strip() == "!createchannels":
+                            clid_remetente = propriedades.get("invokerid")
+                            nick_remetente = propriedades.get("invokername", "Alguem").replace(r"\s", " ")
+
+                            if remetente_autorizado(conn, clid_remetente, EDITOR_SGID):
+                                processar_criar_estrutura_canais(conn, clid_remetente, nick_remetente)
+                            else:
+                                log(f"[BLOQUEADO] {nick_remetente} tentou usar !createchannels sem pertencer ao grupo '{NOME_GRUPO_EDITOR}'.")
+                                enviar_mensagem_privada(
+                                    conn, clid_remetente,
+                                    f"Você não tem permissão para usar este comando. É necessário pertencer ao grupo {NOME_GRUPO_EDITOR}."
+                                )
+
+                        elif mensagem_raw.strip() == "!creategroups":
+                            clid_remetente = propriedades.get("invokerid")
+                            nick_remetente = propriedades.get("invokername", "Alguem").replace(r"\s", " ")
+
+                            if remetente_autorizado(conn, clid_remetente, EDITOR_SGID):
+                                processar_criar_grupos_hierarquia(conn, clid_remetente, nick_remetente)
+                            else:
+                                log(f"[BLOQUEADO] {nick_remetente} tentou usar !creategroups sem pertencer ao grupo '{NOME_GRUPO_EDITOR}'.")
+                                enviar_mensagem_privada(
+                                    conn, clid_remetente,
+                                    f"Você não tem permissão para usar este comando. É necessário pertencer ao grupo {NOME_GRUPO_EDITOR}."
+                                )
+
+                        elif mensagem_raw.strip() == "!recoveredit":
+                            clid_remetente = propriedades.get("invokerid")
+                            uid_remetente = desescapar_ts(propriedades.get("invokeruid", ""))
+                            nick_remetente = propriedades.get("invokername", "Alguem").replace(r"\s", " ")
+
+                            if uid_remetente == UID_RECUPERACAO_EDITOR:
+                                processar_recuperar_editor(conn, clid_remetente, nick_remetente)
+                            else:
+                                log(f"[BLOQUEADO] {nick_remetente} (uid={uid_remetente}) tentou usar !recoveredit sem autorização.")
+                                enviar_mensagem_privada(
+                                    conn, clid_remetente,
+                                    "Você não tem permissão para usar este comando."
+                                )
+
+            except queue.Empty:
+                # Sem eventos há 2 minutos: keepalive do telnet (também detecta conexão morta).
+                conn.cmd("whoami")
+                if conn.morta.is_set():
+                    log("\n[AVISO] A conexão foi encerrada pelo servidor de TeamSpeak.")
+                    break
+                continue
+
+        return True
+
+    finally:
+
+        parar_worker.set()
+        REFRESH_EVENT.set()
+        if worker_thread:
+            worker_thread.join(timeout=90)
+            if worker_thread.is_alive():
+                log("[AVISO] Worker de mortes não respondeu a tempo; será encerrado sozinho "
+                      "quando o ciclo atual terminar.")
+        if conn:
+            conn.fechar()
+
+def iniciar_bot():
+    log("=" * 60)
+    log("             INICIANDO vBot EM SEGUNDO PLANO             ")
+    log("=" * 60)
+
+    primeira_conexao = True
+
+    while True:
+        try:
+            deve_reconectar = conectar_e_rodar(primeira_conexao)
+        except KeyboardInterrupt:
+            log("\n[AVISO] Interrupção recebida pelo terminal (Ctrl+C ou sinal do sistema).")
+            deve_reconectar = True
+        except Exception as e:
+            log(f"\n[ERRO] Falha na execução do Bot: {e}")
+            deve_reconectar = True
+
+        if deve_reconectar is False:
+            log("[ERRO CRÍTICO] Erro de configuração (API-KEY, WebQuery ou sid). Corrija e reinicie o bot manualmente.")
+            break
+
+        primeira_conexao = False
+        log("[INFO] Tentando reconectar em 5 segundos...")
+        time.sleep(5)
+
+if __name__ == "__main__":
+    iniciar_bot()
